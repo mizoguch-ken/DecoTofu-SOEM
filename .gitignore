@@ -1,0 +1,6 @@
+# build folder
+/build
+
+# SOEM folder
+/SOEM/*
+!/SOEM/LICENSE.md
