@@ -1,11 +1,11 @@
-# Symbols DEKOTOFUSOEM exports. This is the only list of exported names:
-# CMake generates the Windows module definition file (dekotofusoem.def) and
-# the GNU ld version script (dekotofusoem.map) from it at configure time.
+# Symbols DECOTOFUSOEM exports. This is the only list of exported names:
+# CMake generates the Windows module definition file (decotofusoem.def) and
+# the GNU ld version script (decotofusoem.map) from it at configure time.
 #
 # The JVM side resolves these names through jnr-ffi
 # (DecoTofu/src/main/java/ken/mizoguch/soem/SoemLibrary.java), so a name here
-# is an ABI: rename or remove one and DecoTofu stops loading. The first seven
-# are implemented by dekotofusoem.c, the rest are SOEM functions that are
+# is an ABI: rename or remove one and DecoTofu stops loading. The first nine
+# are implemented by decotofusoem.c, the rest are SOEM functions that are
 # linked statically into this library and re-exported.
 #
 # One symbol per line, order is preserved in the generated files.
@@ -17,6 +17,8 @@ ec_malloc_parcel
 ec_free_parcel
 ec_run
 ec_wait_thread
+ec_adapters
+ec_free_adapters_list
 ecx_setupdatagram
 ecx_adddatagram
 ecx_BWR

@@ -3,7 +3,7 @@
    DecoTofu binds this library by symbol name and mirrors the struct layouts by
    hand (DecoTofu/src/main/java/ken/mizoguch/soem/SoemLibrary.java and
    SoemEtherCAT.ecx_parcelt), so the exported names - the single list in
-   dekotofusoem.exports, which CMake turns into a module definition file
+   decotofusoem.exports, which CMake turns into a module definition file
    (Windows) or a version script (Linux) - and the member order of ecx_parcelt
    are an ABI. Everything in this file that is static may be refactored
    freely, everything exported has to keep its name, its signature and its
@@ -52,7 +52,14 @@
        clamp in ec_timer_sleep().
    F7  EC_TIMEOUTMON (500 ms, the monitor-thread timeout of the SOEM examples)
        has no meaning in this file. The timeout used for the cyclic receive is
-       EC_TIMEOUTRET, 2000 us (SOEM/soem/ethercattype.h:58). */
+       EC_TIMEOUTRET, 2000 us (SOEM/soem/ethercattype.h:58).
+    F8  oshw_find_adapters() on win32 (SOEM/oshw/win32/oshw.c:37-97) leaves
+        prev_adapter uninitialised - the initialisation the linux flavour has
+        (SOEM/oshw/linux/oshw.c:47) is missing - so the first device takes the
+        "if (prev_adapter)" branch as soon as the stack holds garbage : the
+        head of the list is never stored, the function answers NULL for a
+        machine that has adapters, and it writes through the garbage pointer
+        on the way. ec_adapters() below is that walk done right. */
 
 #include <stddef.h>
 #include <stdlib.h>
@@ -72,6 +79,14 @@
 #if defined(__linux__)
 #include <pthread.h>
 #include <time.h>
+#endif
+
+/* ec_adapters() asks pcap for the adapters of the machine on Windows. The
+   header and the import library come from the wpcap SDK inside the SOEM tree,
+   which CMake puts on the include path and links (CMakeLists.txt); pcap.h
+   selects its Windows flavour on the WIN32 CMake defines for MSVC. */
+#if defined(_WIN32)
+#include <pcap.h>
 #endif
 
 /* Time units: everything SOEM handles is nanoseconds. */
@@ -596,5 +611,77 @@ int ec_wait_thread(ecx_parcelt * parcel, int timeoutMillis)
   (void)parcel;
   (void)timeoutMillis;
   return -1;
+#endif
+}
+
+/* Adapter list ---------------------------------------------------------------
+
+   ec_adapters() answers the linked list of the adapters of the machine, in the
+   order the platform reports them, and ec_free_adapters_list() releases it.
+   The pair is exported instead of SOEM's ec_find_adapters() /
+   ec_free_adapters() pair, which is broken on Windows by fact F8; the ELF
+   targets have no such flaw, so they keep the SOEM answer there. A list
+   answered by ec_adapters() is released by ec_free_adapters_list() only: the
+   nodes of the Windows list are allocated here, and SOEM would release them
+   with its own allocator. */
+ec_adaptert * ec_adapters(void)
+{
+#if defined(_WIN32)
+  pcap_if_t   * alldevs;
+  pcap_if_t   * device;
+  ec_adaptert * adapter;
+  ec_adaptert * prev_adapter = NULL;
+  ec_adaptert * ret_adapter  = NULL;
+  char          errbuf[PCAP_ERRBUF_SIZE];
+
+  if (pcap_findalldevs(&alldevs, errbuf) == -1)
+  {
+    return NULL;
+  }
+  for (device = alldevs; device != NULL; device = device->next)
+  {
+    /* fact F1: allocated zeroed, so an unused name or description stays the
+       empty string the JVM reads instead of heap garbage. */
+    adapter = (ec_adaptert *)calloc(1, sizeof(ec_adaptert));
+    if (adapter == NULL)
+    {
+      break;
+    }
+    if (prev_adapter != NULL)
+    {
+      prev_adapter->next = adapter;
+    }
+    else
+    {
+      ret_adapter = adapter;
+    }
+    if (device->name != NULL)
+    {
+      strncpy(adapter->name, device->name, EC_MAXLEN_ADAPTERNAME - 1);
+    }
+    if (device->description != NULL)
+    {
+      strncpy(adapter->desc, device->description, EC_MAXLEN_ADAPTERNAME - 1);
+    }
+    prev_adapter = adapter;
+  }
+  pcap_freealldevs(alldevs);
+  return ret_adapter;
+#else
+  return ec_find_adapters();
+#endif
+}
+
+void ec_free_adapters_list(ec_adaptert * list)
+{
+#if defined(_WIN32)
+  while (list != NULL)
+  {
+    ec_adaptert * next = list->next;
+    free(list);
+    list = next;
+  }
+#else
+  ec_free_adapters(list);
 #endif
 }
