@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.28)
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake/Modules")
 project(DECOTOFUSOEM C)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
+endif()
+
 if(WIN32)
   set(OS "win32")
   include_directories(SOEM/oshw/win32/wpcap/Include)

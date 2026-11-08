@@ -77,6 +77,7 @@
 #endif
 
 #if defined(__linux__)
+#include <errno.h>
 #include <pthread.h>
 #include <time.h>
 #endif
@@ -186,13 +187,12 @@ static void ** ec_block_slot(void * object, const ec_blockt * block)
   return (void **)((char *)object + block->offset);
 }
 
-/* Allocate every block of a table. Returns the number of rows that could not
-   be filled; the members left NULL are released as a no-op afterwards, so the
-   rollback of a half built object is complete. */
+/* Allocate every block of a table. Returns 0 when all rows were filled, or 1
+   on the first allocation failure; the members left NULL are released as a
+   no-op afterwards, so the rollback of a half built object is complete. */
 static size_t ec_alloc_blocks(void * object, const ec_blockt * table, size_t rows)
 {
   size_t  row;
-  size_t  missing = 0;
 
   for(row = 0; row < rows; row++)
   {
@@ -201,10 +201,10 @@ static size_t ec_alloc_blocks(void * object, const ec_blockt * table, size_t row
     *slot = ec_alloc(table[row].size);
     if(*slot == NULL)
     {
-      missing++;
+      return 1;
     }
   }
-  return missing;
+  return 0;
 }
 
 /* Release every block of a table and clear the member, so the object cannot
@@ -353,7 +353,6 @@ void ec_free_parcel(ecx_parcelt * parcel)
 typedef struct
 {
   struct timespec  deadline;   /* next wake-up, absolute CLOCK_MONOTONIC */
-  struct timespec  remaining;  /* output of clock_nanosleep, unused      */
 } ec_timert;
 
 /* Add nanoseconds to an absolute timespec. */
@@ -362,25 +361,24 @@ static void ec_timespec_add(struct timespec * ts, int64 nsec)
   int64  sec;
   int64  rest;
 
+  sec  = nsec / EC_NSEC_PER_SEC;
   rest = nsec % EC_NSEC_PER_SEC;
-  sec  = (nsec - rest) / EC_NSEC_PER_SEC;
-  ts->tv_sec  += sec;
+  ts->tv_sec  += (time_t)sec;
   ts->tv_nsec += (long)rest;
-  while(ts->tv_nsec < 0)
+  if(ts->tv_nsec < 0)
   {
     /* the correction ec_sync() produces is signed, so tv_nsec can go below
        zero */
     ts->tv_nsec += (long)EC_NSEC_PER_SEC;
     ts->tv_sec  -= 1;
   }
-  if(ts->tv_nsec >= (long)EC_NSEC_PER_SEC)
+  else if(ts->tv_nsec >= (long)EC_NSEC_PER_SEC)
   {
-    /* clock_nanosleep() rejects a tv_nsec of exactly one second with EINVAL,
+    /* clock_nanosleep() rejects a tv_nsec of one second or more with EINVAL,
        so normalise with '>=' like the SOEM reference does
        (SOEM/test/linux/red_test/red_test.c:161-175). */
-    rest = ts->tv_nsec % (long)EC_NSEC_PER_SEC;
-    ts->tv_sec  += (ts->tv_nsec - rest) / (long)EC_NSEC_PER_SEC;
-    ts->tv_nsec  = (long)rest;
+    ts->tv_nsec -= (long)EC_NSEC_PER_SEC;
+    ts->tv_sec  += 1;
   }
 }
 
@@ -392,13 +390,20 @@ static void ec_timer_start(ec_timert * timer)
   clock_gettime(CLOCK_MONOTONIC, &timer->deadline);
   timer->deadline.tv_nsec = ((timer->deadline.tv_nsec / (long)EC_NSEC_PER_MSEC)
                              + 1) * (long)EC_NSEC_PER_MSEC;
+  if(timer->deadline.tv_nsec >= (long)EC_NSEC_PER_SEC)
+  {
+    timer->deadline.tv_nsec -= (long)EC_NSEC_PER_SEC;
+    timer->deadline.tv_sec  += 1;
+  }
 }
 
 static void ec_timer_sleep(ec_timert * timer, int64 nsec)
 {
   ec_timespec_add(&timer->deadline, nsec);
-  clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &timer->deadline,
-                  &timer->remaining);
+  while(clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &timer->deadline,
+                        NULL) == EINTR)
+  {
+  }
 }
 
 #else  /* no absolute monotonic sleep available through libc here */
@@ -415,10 +420,17 @@ static void ec_timer_start(ec_timert * timer)
 
 static void ec_timer_sleep(ec_timert * timer, int64 nsec)
 {
+  int64  usec;
+
   (void)timer;
   if(nsec > 0)
   {
-    osal_usleep((uint32)(nsec / EC_NSEC_PER_USEC));
+    usec = nsec / EC_NSEC_PER_USEC;
+    if(usec > (int64)0xFFFFFFFFU)
+    {
+      usec = (int64)0xFFFFFFFFU;
+    }
+    osal_usleep((uint32)usec);
   }
   /* nsec <= 0 means "this cycle is already late": run the next cycle at once
      instead of sleeping, and never hand a negative length to osal_usleep()
@@ -446,6 +458,10 @@ static void ec_sync(int64 * reftime, int64 cycletime, int64 * offsettime,
     return;
   }
   delta = (*reftime - EC_SYNC_REF_NSEC) % cycletime;
+  if(delta < 0)
+  {
+    delta += cycletime;
+  }
   if(delta > (cycletime / 2))
   {
     delta -= cycletime;
@@ -454,7 +470,7 @@ static void ec_sync(int64 * reftime, int64 cycletime, int64 * offsettime,
   {
     (*integral)++;
   }
-  if(delta < 0)
+  else if(delta < 0)
   {
     (*integral)--;
   }
@@ -476,6 +492,7 @@ static OSAL_THREAD_FUNC_RT ecatthread(void * ptr)
   volatile boolean * isprocess;
   int64 *            dctime;
   uint8 *            hasdc;
+  int64              cycle;
   int64              toff     = 0;
   int64              integral = 0;
   ec_timert          timer;
@@ -506,21 +523,32 @@ static OSAL_THREAD_FUNC_RT ecatthread(void * ptr)
     *wkc = ecx_receive_processdata(context, EC_TIMEOUTRET);
     *isprocess = FALSE;
 
-    ec_timer_sleep(&timer, *cycletime + toff);
+    cycle = *cycletime;
+    ec_timer_sleep(&timer, cycle + toff);
+    if(!*dorun)
+    {
+      break;
+    }
 
     *isprocess = TRUE;
     if(*hasdc)
     {
-      ec_sync(dctime, *cycletime, &toff, &integral);
+      ec_sync(dctime, cycle, &toff, &integral);
     }
     ecx_send_processdata(context);
   }
+  *isprocess = FALSE;
 }
 
 /* Start the cyclic thread. Returns 0 when the thread did not start. */
 int ec_run(ecx_parcelt * parcel)
 {
-  if(parcel == NULL || parcel->context == NULL || parcel->thread == NULL)
+  if(parcel == NULL || parcel->context == NULL || parcel->thread == NULL
+     || parcel->wkc == NULL || parcel->cycletime == NULL
+     || parcel->dorun == NULL || parcel->isprocess == NULL
+     || parcel->context->slavelist == NULL
+     || parcel->context->DCtime == NULL
+     || *parcel->thread != 0)
   {
     return 0;
   }
@@ -585,11 +613,20 @@ int ec_wait_thread(ecx_parcelt * parcel, int timeoutMillis)
   {
     return 1;
   }
+  if(timeoutMillis < 0)
+  {
+    if(pthread_join(*threadp, NULL) != 0)
+    {
+      return 0;
+    }
+    *threadp = 0;
+    return 1;
+  }
   if(clock_gettime(CLOCK_REALTIME, &deadline) != 0)
   {
     return -1;
   }
-  millis = (timeoutMillis < 0) ? 0x7FFFFFFFLL : (long long)timeoutMillis;
+  millis = (long long)timeoutMillis;
   deadline.tv_sec  += (time_t)(millis / 1000);
   deadline.tv_nsec += (long)((millis % 1000) * 1000000L);
   if(deadline.tv_nsec >= 1000000000L)
@@ -642,9 +679,11 @@ ec_adaptert * ec_adapters(void)
   {
     /* fact F1: allocated zeroed, so an unused name or description stays the
        empty string the JVM reads instead of heap garbage. */
-    adapter = (ec_adaptert *)calloc(1, sizeof(ec_adaptert));
+    adapter = (ec_adaptert *)ec_alloc(sizeof(ec_adaptert));
     if (adapter == NULL)
     {
+      ec_free_adapters_list(ret_adapter);
+      ret_adapter = NULL;
       break;
     }
     if (prev_adapter != NULL)
@@ -678,7 +717,7 @@ void ec_free_adapters_list(ec_adaptert * list)
   while (list != NULL)
   {
     ec_adaptert * next = list->next;
-    free(list);
+    osal_free(list);
     list = next;
   }
 #else
