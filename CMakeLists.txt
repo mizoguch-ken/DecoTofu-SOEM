@@ -80,7 +80,8 @@ add_library(decotofusoem SHARED
 target_link_libraries(decotofusoem ${OS_LIBS})
 
 target_include_directories(decotofusoem PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/SOEM/soem>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/SOEM/include>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/SOEM/build/include>
   $<INSTALL_INTERFACE:include/decotofusoem>)
 
 target_include_directories(decotofusoem PUBLIC

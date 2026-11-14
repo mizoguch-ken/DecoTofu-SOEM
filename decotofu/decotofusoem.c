@@ -15,72 +15,64 @@
    file scope globals, and a cyclic EtherCAT thread the JVM can start and stop
    without owning a C thread handle.
 
-   Facts about SOEM 2.0.0 this file depends on
-   -------------------------------------------
+   Facts about SOEM 2.0 this file depends on
+   -----------------------------------------
    F1  SOEM is written against statically initialised buffers (see
-       SOEM/test/linux/simple_test.c:29-45). malloc() hands out garbage, and
-       ecx_pusherror() (SOEM/soem/ethercatmain.c:90) indexes
+       SOEM/samples/ec_sample/ec_sample.c:18-27). malloc() hands out garbage,
+       and ecx_pusherror() (SOEM/src/ec_main.c:88) indexes
        ec_eringt.Error[] with ec_eringt.head before any range check, while the
        LRW helpers index ec_idxstackT with its uint8 pushed/pulled counters.
        Every block below is therefore allocated zeroed, and allocated through
        the OSAL allocator so that this shim and SOEM stay consistent on the
-       non-libc OSAL targets (intime/rtk/vxworks).
-   F2  ecx_init_context() (SOEM/soem/ethercatconfig.c:47-62, called by
-       ecx_config_init() at ethercatconfig.c:198) resets slavecount and
+       non-libc OSAL targets (rtk).
+   F2  ecx_init_context() (SOEM/src/ec_config.c:41-56, called by
+       ecx_config_init() at ec_config.c:187) resets slavecount and
        memsets slavelist and grouplist, but never ec_eringt.head/tail,
-       ec_idxstackT.pushed/pulled, *ecaterror or *DCtime. Those have to start
+       ec_idxstackT.pushed/pulled, ecaterror or DCtime. Those have to start
        at 0/FALSE here, otherwise ecx_pusherror() writes
        elist.Error[garbage head] out of bounds and the v2 ecx_LRWDC FPRMW
-       payload (SOEM/soem/ethercatbase.c:523, DCtE = htoell(*DCtime)) puts a
+       payload (SOEM/src/ec_base.c:526, DCtE = htoell(*DCtime)) puts a
        garbage DC time on the wire.
-   F3  ecx_close() destroys the mutex inside context->mbxpool
-       (SOEM/soem/ethercatmain.c:259), and ecx_init() has to have created that
-       mutex first: the caller has to run ecx_init(), then ecx_close(), then
+   F3  ecx_close() (SOEM/src/ec_main.c:287-299) destroys the per-group
+       grouplist[lp].mbxtxqueue.mbxmutex mutexes created by ecx_config_init()
+       and the context->mbxpool.mbxmutex mutex created by ecx_init(), and closes
+       the NIC: the caller has to run ecx_init(), then ecx_close(), then
        ec_free_context().
-   F4  ecx_config_init() -> ecx_initmbxqueue() (ethercatconfig.c:60,
-       ethercatmain.c:318) creates one mutex per group and nothing in SOEM ever
-       destroys it, while the handle lives inside the grouplist block. That is
-       why ec_free_context() walks the groups before releasing the blocks.
-   F5  osal_thread_create_rt() on win32 (SOEM/osal/win32/osal.c:145-154) tests
-       the wrong operand - if(!thandle) instead of the handle it just wrote -
-       and then returns the result of SetThreadPriority(), so its return value
-       says nothing about whether CreateThread() succeeded. ec_run() therefore
-       validates the handle it produced.
-   F6  osal_usleep() takes a uint32 number of microseconds (SOEM/osal/osal.h:51,
-       SOEM/osal/win32/osal.c:113), so a negative sleep length wraps into an
+   F4  osal_thread_create_rt() on win32 (SOEM/osal/win32/osal.c:145-156)
+       returns the result of SetThreadPriority() after CreateThread(), so a
+       priority failure reports 0 even when the thread is running. ec_run()
+       therefore validates the handle it produced.
+   F5  osal_usleep() takes a uint32 number of microseconds (SOEM/osal/osal.h:96,
+       SOEM/osal/win32/osal.c:74), so a negative sleep length wraps into an
        enormous delay. The DC correction of ec_sync() is signed, hence the
        clamp in ec_timer_sleep().
-   F7  EC_TIMEOUTMON (500 ms, the monitor-thread timeout of the SOEM examples)
+   F6  EC_TIMEOUTMON (500 ms, the monitor-thread timeout of the SOEM examples)
        has no meaning in this file. The timeout used for the cyclic receive is
-       EC_TIMEOUTRET, 2000 us (SOEM/soem/ethercattype.h:58).
-    F8  oshw_find_adapters() on win32 (SOEM/oshw/win32/oshw.c:37-97) leaves
-        prev_adapter uninitialised - the initialisation the linux flavour has
-        (SOEM/oshw/linux/oshw.c:47) is missing - so the first device takes the
-        "if (prev_adapter)" branch as soon as the stack holds garbage : the
-        head of the list is never stored, the function answers NULL for a
-        machine that has adapters, and it writes through the garbage pointer
-        on the way. ec_adapters() below is that walk done right. */
+       EC_TIMEOUTRET, 2000 us (SOEM/include/soem/ec_options.h.in:87).
+   F7  oshw_find_adapters() on win32 (SOEM/oshw/win32/oshw.c:37-97) allocates
+       nodes with libc malloc() rather than osal_malloc() and leaves strings
+       unzeroed beyond the terminating NUL. ec_adapters() below allocates
+       zeroed nodes via ec_alloc() and releases them via osal_free(). */
+
+/* SOEM 2.0 uses struct timespec / clock_gettime on the ELF targets, which
+   only come from <time.h>; TIMER_ABSTIME / clock_nanosleep come from
+   <pthread.h>. pthread_timedjoin_np(), used by ec_wait_thread(), is a GNU
+   extension and requires _GNU_SOURCE before any system header is included. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
-
-#include "ethercat.h"
-
-/* SOEM 2.0.0 uses struct timespec / clock_gettime on the ELF targets, which
-   only come from <time.h>; TIMER_ABSTIME / clock_nanosleep come from
-   <pthread.h>. ethercat.h -> ethercattype.h -> osal.h pulls in osal_defs.h,
-   stdint.h and stddef.h only, so make the <time.h> dependency explicit.
-   pthread_timedjoin_np(), used by ec_wait_thread(), is a GNU extension. */
-#if defined(__linux__) && !defined(_GNU_SOURCE)
-#define _GNU_SOURCE
-#endif
 
 #if defined(__linux__)
 #include <errno.h>
 #include <pthread.h>
 #include <time.h>
 #endif
+
+#include "soem/soem.h"
 
 /* ec_adapters() asks pcap for the adapters of the machine on Windows. The
    header and the import library come from the wpcap SDK inside the SOEM tree,
@@ -121,11 +113,13 @@ typedef struct ecx_parcel
    functions that are defined further down. */
 void ec_free_context(ecx_contextt * context);
 void ec_free_parcel(ecx_parcelt * parcel);
+void ec_free_adapters_list(ec_adaptert * list);
 
 /* One heap block referenced by a pointer member of a dynamically allocated
-   SOEM object. Describing the blocks in one table means the allocation, the
-   "did something fail?" check and the release cannot drift apart when
-   ecx_contextt gains a member: adding one row is the whole change. */
+   parcel object. Describing the blocks in one table means the allocation, the
+   "did something fail?" check and the release cannot drift apart.
+   parcel->context points at memory owned by the context, so it has no row
+   here. */
 typedef struct
 {
   size_t  offset;   /* offsetof(anchor, pointer member) inside the object  */
@@ -135,28 +129,6 @@ typedef struct
 #define EC_BLOCK(anchor, field, bytes)  { offsetof(anchor, field), (bytes) }
 #define EC_BLOCKS(table)                (sizeof(table) / sizeof((table)[0]))
 
-static const ec_blockt ec_context_blocks[] =
-{
-  EC_BLOCK(ecx_contextt, mbxpool,    sizeof(ec_mbxpoolt)),
-  EC_BLOCK(ecx_contextt, port,       sizeof(ecx_portt)),
-  EC_BLOCK(ecx_contextt, slavelist,  sizeof(ec_slavet) * EC_MAXSLAVE),
-  EC_BLOCK(ecx_contextt, slavecount, sizeof(int)),
-  EC_BLOCK(ecx_contextt, grouplist,  sizeof(ec_groupt) * EC_MAXGROUP),
-  EC_BLOCK(ecx_contextt, esibuf,     EC_MAXEEPBUF),
-  EC_BLOCK(ecx_contextt, esimap,     sizeof(uint32) * EC_MAXEEPBITMAP),
-  EC_BLOCK(ecx_contextt, elist,      sizeof(ec_eringt)),
-  EC_BLOCK(ecx_contextt, idxstack,   sizeof(ec_idxstackT)),
-  EC_BLOCK(ecx_contextt, ecaterror,  sizeof(boolean)),
-  EC_BLOCK(ecx_contextt, DCtime,     sizeof(int64)),
-  EC_BLOCK(ecx_contextt, SMcommtype, sizeof(ec_SMcommtypet) * EC_MAX_MAPT),
-  EC_BLOCK(ecx_contextt, PDOassign,  sizeof(ec_PDOassignt) * EC_MAX_MAPT),
-  EC_BLOCK(ecx_contextt, PDOdesc,    sizeof(ec_PDOdesct) * EC_MAX_MAPT),
-  EC_BLOCK(ecx_contextt, eepSM,      sizeof(ec_eepromSMt)),
-  EC_BLOCK(ecx_contextt, eepFMMU,    sizeof(ec_eepromFMMUt))
-};
-
-/* The blocks of the parcel, same mechanism. parcel->context points at memory
-   owned by the context, so it has no row here. */
 static const ec_blockt ec_parcel_blocks[] =
 {
   EC_BLOCK(ecx_parcelt, thread,     sizeof(OSAL_THREAD_HANDLE)),
@@ -179,9 +151,8 @@ static void * ec_alloc(size_t size)
 }
 
 /* Address of the pointer member one row of a block table describes. Every
-   data pointer of ecx_contextt / ecx_parcelt has the same representation on
-   every target this shim is built for, which is what makes the offset lookup
-   safe. */
+   data pointer of ecx_parcelt has the same representation on every target this
+   shim is built for, which is what makes the offset lookup safe. */
 static void ** ec_block_slot(void * object, const ec_blockt * block)
 {
   return (void **)((char *)object + block->offset);
@@ -233,63 +204,29 @@ ecx_contextt * ec_malloc_context(void)
   {
     return NULL;
   }
-  if(ec_alloc_blocks(context, ec_context_blocks,
-                     EC_BLOCKS(ec_context_blocks)) != 0)
-  {
-    /* ec_free_context() takes a half built context apart: the members the
-       table could not fill are still NULL and osal_free(NULL) does nothing. */
-    ec_free_context(context);
-    return NULL;
-  }
-  /* The redundancy bookkeeping hangs off ecx_portt instead of ecx_contextt,
-     so it cannot be a row of the table. */
-  context->port->redport = ec_alloc(sizeof(ecx_redportt));
-  if(context->port->redport == NULL)
+  /* In SOEM 2.0, port, slavelist, grouplist, esibuf, esimap, elist, idxstack,
+     SMcommtype, PDOassign, PDOdesc, eepSM, eepFMMU and mbxpool are inline
+     members of ecx_contextt and are zero-initialised by ec_alloc() above
+     (facts F1 and F2). Only port.redport is a separate heap block. */
+  context->port.redport = ec_alloc(sizeof(ecx_redportt));
+  if(context->port.redport == NULL)
   {
     ec_free_context(context);
     return NULL;
   }
-  /* The sizes the table cannot express, plus the members SOEM inspects without
-     ever initialising them (fact F2, the zeroed allocation covers them all). */
-  context->maxslave          = EC_MAXSLAVE;
-  context->maxgroup          = EC_MAXGROUP;
-  context->esislave          = 0;
-  context->FOEhook           = NULL;
-  context->EOEhook           = NULL;
-  context->manualstatechange = 0;
-  context->userdata          = NULL;
   return context;
 }
 
 void ec_free_context(ecx_contextt * context)
 {
-  int  group;
-
   if(context == NULL)
   {
     return;
   }
-  if(context->grouplist != NULL)
-  {
-    /* Fact F4: one mailbox transmit mutex per group, created by
-       ecx_config_init() and never destroyed by SOEM. The blocks were
-       allocated zeroed, so a NULL handle means "this group was never
-       configured", and a half built context has maxgroup == 0. */
-    for(group = 0; group < context->maxgroup; group++)
-    {
-      if(context->grouplist[group].mbxtxqueue.mbxmutex != NULL)
-      {
-        osal_mutex_destroy(context->grouplist[group].mbxtxqueue.mbxmutex);
-        context->grouplist[group].mbxtxqueue.mbxmutex = NULL;
-      }
-    }
-  }
-  if(context->port != NULL)
-  {
-    osal_free(context->port->redport);
-    context->port->redport = NULL;
-  }
-  ec_free_blocks(context, ec_context_blocks, EC_BLOCKS(ec_context_blocks));
+  /* Fact F3: ecx_close() already destroys grouplist[lp].mbxtxqueue.mbxmutex
+     and mbxpool.mbxmutex before ec_free_context() is called. */
+  osal_free(context->port.redport);
+  context->port.redport = NULL;
   osal_free(context);
 }
 
@@ -297,11 +234,11 @@ void ec_free_context(ecx_contextt * context)
    know where it lives inside ecx_portt. */
 ecx_redportt * ec_redport(ecx_contextt * context)
 {
-  if(context == NULL || context->port == NULL)
+  if(context == NULL)
   {
     return NULL;
   }
-  return context->port->redport;
+  return context->port.redport;
 }
 
 /* ------------------------------------------------------------------exported
@@ -434,7 +371,7 @@ static void ec_timer_sleep(ec_timert * timer, int64 nsec)
   }
   /* nsec <= 0 means "this cycle is already late": run the next cycle at once
      instead of sleeping, and never hand a negative length to osal_usleep()
-     (fact F6). */
+     (fact F5). */
 }
 
 #endif
@@ -501,9 +438,7 @@ static OSAL_THREAD_FUNC_RT ecatthread(void * ptr)
      JVM process, so a fault here takes DecoTofu down with it. */
   if(parcel == NULL || parcel->context == NULL || parcel->wkc == NULL
      || parcel->cycletime == NULL || parcel->dorun == NULL
-     || parcel->isprocess == NULL
-     || parcel->context->slavelist == NULL
-     || parcel->context->DCtime == NULL)
+     || parcel->isprocess == NULL)
   {
     return;
   }
@@ -512,7 +447,7 @@ static OSAL_THREAD_FUNC_RT ecatthread(void * ptr)
   cycletime = parcel->cycletime;
   dorun     = parcel->dorun;
   isprocess = parcel->isprocess;
-  dctime    = context->DCtime;
+  dctime    = &context->DCtime;
   hasdc     = &(context->slavelist[0].hasdc);
 
   ec_timer_start(&timer);
@@ -546,14 +481,12 @@ int ec_run(ecx_parcelt * parcel)
   if(parcel == NULL || parcel->context == NULL || parcel->thread == NULL
      || parcel->wkc == NULL || parcel->cycletime == NULL
      || parcel->dorun == NULL || parcel->isprocess == NULL
-     || parcel->context->slavelist == NULL
-     || parcel->context->DCtime == NULL
      || *parcel->thread != 0)
   {
     return 0;
   }
   /* Clear the handle first, then trust the handle and not the return value
-     (fact F5). The cast is needed because osal_thread_create_rt() takes the
+     (fact F4). The cast is needed because osal_thread_create_rt() takes the
      entry point as a void *, which is not a function pointer (C4152). */
   *parcel->thread = 0;
   (void)osal_thread_create_rt(parcel->thread, ECAT_THREAD_STACKSIZE,
@@ -656,7 +589,7 @@ int ec_wait_thread(ecx_parcelt * parcel, int timeoutMillis)
    ec_adapters() answers the linked list of the adapters of the machine, in the
    order the platform reports them, and ec_free_adapters_list() releases it.
    The pair is exported instead of SOEM's ec_find_adapters() /
-   ec_free_adapters() pair, which is broken on Windows by fact F8; the ELF
+   ec_free_adapters() pair, which is broken on Windows by fact F7; the ELF
    targets have no such flaw, so they keep the SOEM answer there. A list
    answered by ec_adapters() is released by ec_free_adapters_list() only: the
    nodes of the Windows list are allocated here, and SOEM would release them

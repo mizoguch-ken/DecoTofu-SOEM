@@ -2,8 +2,8 @@
 
 ## Overview / 概要
 
-* **DecoTofu-SOEM** is the native shared library (`decotofusoem.dll` on Windows, `libdecotofusoem.so` on Linux, `libdecotofusoem.dylib` on macOS) that bridges [DecoTofu](https://github.com/mizoguch-ken/DecoTofu) (`jnr-ffi`) and the **Simple Open EtherCAT Master (SOEM 2.0.0)** library.
-* **DecoTofu-SOEM** は、[DecoTofu](https://github.com/mizoguch-ken/DecoTofu)（`jnr-ffi`）と **Simple Open EtherCAT Master (SOEM 2.0.0)** ライブラリを接続するネイティブ共有ライブラリ（Windows: `decotofusoem.dll`、Linux: `libdecotofusoem.so`、macOS: `libdecotofusoem.dylib`）です。
+* **DecoTofu-SOEM** is the native shared library (`decotofusoem.dll` on Windows, `libdecotofusoem.so` on Linux, `libdecotofusoem.dylib` on macOS) that bridges [DecoTofu](https://github.com/mizoguch-ken/DecoTofu) (`jnr-ffi`) and the **Simple Open EtherCAT Master (SOEM 2.0)** library.
+* **DecoTofu-SOEM** は、[DecoTofu](https://github.com/mizoguch-ken/DecoTofu)（`jnr-ffi`）と **Simple Open EtherCAT Master (SOEM 2.0)** ライブラリを接続するネイティブ共有ライブラリ（Windows: `decotofusoem.dll`、Linux: `libdecotofusoem.so`、macOS: `libdecotofusoem.dylib`）です。
 * It links SOEM statically, re-exports SOEM's `ecx_*` / `ec_*` functions through a single canonical symbol table (`decotofu/decotofusoem.exports`), and provides 9 C shim functions for heap-allocated SOEM contexts, Distributed Clocks (DC) cyclic process data threads, clean thread termination, and safe network adapter enumeration.
 * SOEM を静的リンクした上で、単一のシンボル定義ファイル（`decotofu/decotofusoem.exports`）から SOEM 関数を再エクスポートし、さらにヒープ上でのコンテキスト管理、DC（Distributed Clocks）同期付きの周期プロセスデータ通信スレッド、安全なスレッド終了待機、およびネットワークアダプタ列挙を行う 9 個の C シム関数を提供します。
 
@@ -72,8 +72,8 @@ make
 
 ### Canonical Export List (`decotofu/decotofusoem.exports`)
 
-* `decotofu/decotofusoem.exports` is the single source of truth for all 112 symbols exported by this library (9 shim functions implemented in `decotofu/decotofusoem.c` + 103 SOEM functions statically linked and re-exported).
-  * `decotofu/decotofusoem.exports` は、本ライブラリがエクスポートする全 112 シンボル（`decotofu/decotofusoem.c` で実装された 9 個のシム関数＋静的リンクされた SOEM から再エクスポートされる 103 個の関数）の単一の定義リストです。
+* `decotofu/decotofusoem.exports` is the single source of truth for all 109 symbols exported by this library (9 shim functions implemented in `decotofu/decotofusoem.c` + 100 SOEM functions statically linked and re-exported).
+  * `decotofu/decotofusoem.exports` は、本ライブラリがエクスポートする全 109 シンボル（`decotofu/decotofusoem.c` で実装された 9 個のシム関数＋静的リンクされた SOEM から再エクスポートされる 100 個の関数）の単一の定義リストです。
 * DecoTofu resolves these symbols by name via `jnr-ffi` (`SoemLibrary.java`), making this list the binary ABI contract.
   * DecoTofu は `jnr-ffi`（`SoemLibrary.java`）を通じてこれらのシンボルを名前解決するため、このリスト自体がバイナリ ABI となります。
 * At CMake configure time, CMake automatically generates:
@@ -86,9 +86,9 @@ make
 
 | Function / 関数 | Description / 説明 |
 | :--- | :--- |
-| `ecx_contextt *ec_malloc_context(void)` | Allocates and zero-initializes a complete `ecx_contextt` structure and all sub-blocks on the heap via `osal_malloc`, ensuring `elist`, `idxstack`, `ecaterror`, and `DCtime` start cleanly at `0` / `FALSE` and rolling back completely on out-of-memory.<br>`osal_malloc` を用いてゼロ初期化された `ecx_contextt` と全サブブロックをヒープ上に確保します（メモリ不足時は確保済みブロックを全て解放して `NULL` を返します）。 |
-| `void ec_free_context(ecx_contextt *context)` | Destroys per-group mailbox queue mutexes (`pthread_mutex_destroy` / `CloseHandle`) created by `ecx_config_init()` and frees all sub-blocks of `context`. Call after `ecx_close(context)`.<br>`ecx_config_init()` が生成したグループごとのメールボックスミューテックスを破棄し、`context` の全ブロックを解放します（`ecx_close(context)` の後に呼び出します）。 |
-| `ecx_redportt *ec_redport(ecx_contextt *context)` | Returns `context->port->redport` for configuring redundant EtherCAT network interfaces (`ecx_init_redundant`).<br>冗長 EtherCAT ポート構成（`ecx_init_redundant`）のために `context->port->redport` を返します。 |
+| `ecx_contextt *ec_malloc_context(void)` | Allocates and zero-initializes a complete `ecx_contextt` structure (including its inlined `port`, `slavelist`, `grouplist`, `elist`, `idxstack`, `mbxpool`, etc.) and `port.redport` on the heap via `osal_malloc`, rolling back completely on out-of-memory.<br>`osal_malloc` を用いてゼロ初期化された `ecx_contextt` と冗長ポート `port.redport` をヒープ上に確保します（メモリ不足時は確保済みブロックを全て解放して `NULL` を返します）。 |
+| `void ec_free_context(ecx_contextt *context)` | Frees `context->port.redport` and `context`. Call after `ecx_close(context)` (which destroys `grouplist[lp].mbxtxqueue.mbxmutex` and `mbxpool.mbxmutex`).<br>`context->port.redport` および `context` を解放します（ミューテックスを破棄する `ecx_close(context)` の後に呼び出します）。 |
+| `ecx_redportt *ec_redport(ecx_contextt *context)` | Returns `context->port.redport` for configuring redundant EtherCAT network interfaces (`ecx_init_redundant`).<br>冗長 EtherCAT ポート構成（`ecx_init_redundant`）のために `context->port.redport` を返します。 |
 | `ecx_parcelt *ec_malloc_parcel(ecx_contextt *context)` | Allocates and zero-initializes an `ecx_parcelt` communication parcel sharing `context`, `thread`, `wkc`, `cycletime`, `dorun`, and `isprocess` between the JVM and the native cyclic thread.<br>JVM とネイティブ周期スレッド間で共有される `ecx_parcelt` パケット構造体をゼロ初期化して確保します。 |
 | `void ec_free_parcel(ecx_parcelt *parcel)` | Releases the sub-fields of `parcel` (excluding `context`, which is owned separately) and frees `parcel` itself. On Windows, closes the native thread handle if still open.<br>`parcel` の各サブフィールド（`context` を除く）および Windows のスレッドハンドルを解放します。 |
 | `int ec_run(ecx_parcelt *parcel)` | Validates `parcel` and its inner pointers, guards against duplicate thread launches, and starts the real-time cyclic EtherCAT process data thread (`ecatthread`) via `osal_thread_create_rt`.<br>`parcel` と内部ポインタの妥当性および二重起動を検査した上で、`osal_thread_create_rt` によりリアルタイム周期スレッド（`ecatthread`）を起動します。 |
