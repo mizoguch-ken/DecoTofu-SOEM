@@ -4,7 +4,7 @@
 #
 # The JVM side resolves these names through jnr-ffi
 # (DecoTofu/src/main/java/ken/mizoguch/soem/SoemLibrary.java), so a name here
-# is an ABI: rename or remove one and DecoTofu stops loading. The first nine
+# is an ABI: keep existing names intact and append new exports only. The first 17
 # are implemented by decotofusoem.c, the rest are SOEM functions that are
 # linked statically into this library and re-exported.
 #
@@ -19,6 +19,14 @@ ec_run
 ec_wait_thread
 ec_adapters
 ec_free_adapters_list
+ec_stop
+ec_version
+ec_sizeof_context
+ec_sizeof_parcel
+ec_sizeof_slave
+ec_sizeof_group
+ec_max_slave
+ec_max_group
 ecx_setupdatagram
 ecx_adddatagram
 ecx_BWR

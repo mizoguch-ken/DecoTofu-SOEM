@@ -31,8 +31,7 @@
        ec_idxstackT.pushed/pulled, ecaterror or DCtime. Those have to start
        at 0/FALSE here, otherwise ecx_pusherror() writes
        elist.Error[garbage head] out of bounds and the v2 ecx_LRWDC FPRMW
-       payload (SOEM/src/ec_base.c:526, DCtE = htoell(*DCtime)) puts a
-       garbage DC time on the wire.
+       payload puts a garbage DC time on the wire.
    F3  ecx_close() (SOEM/src/ec_main.c:287-299) destroys the per-group
        grouplist[lp].mbxtxqueue.mbxmutex mutexes created by ecx_config_init()
        and the context->mbxpool.mbxmutex mutex created by ecx_init(), and closes
@@ -44,35 +43,39 @@
        therefore validates the handle it produced.
    F5  osal_usleep() takes a uint32 number of microseconds (SOEM/osal/osal.h:96,
        SOEM/osal/win32/osal.c:74), so a negative sleep length wraps into an
-       enormous delay. The DC correction of ec_sync() is signed, hence the
-       clamp in ec_timer_sleep().
+       enormous delay. osal_monotonic_sleep() on win32 takes an absolute
+       deadline backed by QueryPerformanceCounter().
    F6  EC_TIMEOUTMON (500 ms, the monitor-thread timeout of the SOEM examples)
        has no meaning in this file. The timeout used for the cyclic receive is
        EC_TIMEOUTRET, 2000 us (SOEM/include/soem/ec_options.h.in:87).
-   F7  oshw_find_adapters() on win32 (SOEM/oshw/win32/oshw.c:37-97) allocates
-       nodes with libc malloc() rather than osal_malloc() and leaves strings
-       unzeroed beyond the terminating NUL. ec_adapters() below allocates
-       zeroed nodes via ec_alloc() and releases them via osal_free(). */
+   F7  SOEM's oshw_find_adapters() allocates nodes with libc malloc() (without
+       OOM or NULL checks in some implementations) rather than zero-initialised
+       OSAL allocations. ec_adapters() allocates zeroed nodes via ec_alloc() on
+       Windows and Linux and releases them via osal_free(). */
 
 /* SOEM 2.0 uses struct timespec / clock_gettime on the ELF targets, which
    only come from <time.h>; TIMER_ABSTIME / clock_nanosleep come from
-   <pthread.h>. pthread_timedjoin_np(), used by ec_wait_thread(), is a GNU
-   extension and requires _GNU_SOURCE before any system header is included. */
+   <pthread.h>. pthread_timedjoin_np() and pthread_tryjoin_np(), used by
+   ec_wait_thread(), are GNU extensions and require _GNU_SOURCE before any
+   system header is included. */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE
 #endif
 
+#include <limits.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #if defined(__linux__)
 #include <errno.h>
+#include <net/if.h>
 #include <pthread.h>
 #include <time.h>
 #endif
 
-#include "soem/soem.h"
+#include "decotofusoem.h"
 
 /* ec_adapters() asks pcap for the adapters of the machine on Windows. The
    header and the import library come from the wpcap SDK inside the SOEM tree,
@@ -86,34 +89,28 @@
 #define EC_NSEC_PER_SEC         1000000000LL
 #define EC_NSEC_PER_MSEC        1000000LL
 #define EC_NSEC_PER_USEC        1000LL
+#define EC_MAX_SLEEP_NSEC       ((int64)0xFFFFFFFFU * EC_NSEC_PER_USEC)
+#define EC_SLEEP_SLICE_NSEC     (50LL * EC_NSEC_PER_MSEC)
+#define EC_SLEEP_SLICE_USEC     50000LL
 
 /* Stack size of the cyclic thread, the size the SOEM examples use. */
 #define ECAT_THREAD_STACKSIZE   128000
 
+/* Max cyclic mailbox messages handled per EtherCAT cycle (SOEM ec_sample). */
+#define ECAT_MBX_HANDLER_LIMIT  4
+
 /* DC drift correction, the same constants as the reference loop in
-   SOEM/test/linux/red_test/red_test.c:183-187. */
+   SOEM reference code. */
 #define EC_SYNC_REF_NSEC        50000   /* phase reference inside a cycle  */
 #define EC_SYNC_ERROR_SCALE     100     /* ns of drift per integrator step */
 #define EC_SYNC_INTEGRATOR_DIV  20      /* leak factor of the integrator   */
 
-/* Parcel: the small set of pointers the JVM and the cyclic thread share.
-   The member order is part of the ABI, it is mirrored by SoemEtherCAT.
-   ecx_parcelt in DecoTofu: not one member may be added, removed or moved. */
-typedef struct ecx_parcel
-{
-  ecx_contextt        *context;
-  OSAL_THREAD_HANDLE  *thread;
-  int                 *wkc;
-  int64               *cycletime;
-  boolean             *dorun;
-  boolean             *isprocess;
-} ecx_parcelt;
-
-/* Forward declarations: the allocation rollback paths below call the free
-   functions that are defined further down. */
-void ec_free_context(ecx_contextt * context);
-void ec_free_parcel(ecx_parcelt * parcel);
-void ec_free_adapters_list(ec_adaptert * list);
+#if defined(__linux__)
+#define EC_THREAD_STORAGE_SIZE \
+  (sizeof(pthread_t) > sizeof(OSAL_THREAD_HANDLE) ? sizeof(pthread_t) : sizeof(OSAL_THREAD_HANDLE))
+#else
+#define EC_THREAD_STORAGE_SIZE  sizeof(OSAL_THREAD_HANDLE)
+#endif
 
 /* One heap block referenced by a pointer member of a dynamically allocated
    parcel object. Describing the blocks in one table means the allocation, the
@@ -131,7 +128,7 @@ typedef struct
 
 static const ec_blockt ec_parcel_blocks[] =
 {
-  EC_BLOCK(ecx_parcelt, thread,     sizeof(OSAL_THREAD_HANDLE)),
+  EC_BLOCK(ecx_parcelt, thread,     EC_THREAD_STORAGE_SIZE),
   EC_BLOCK(ecx_parcelt, wkc,        sizeof(int)),
   EC_BLOCK(ecx_parcelt, cycletime,  sizeof(int64)),
   EC_BLOCK(ecx_parcelt, dorun,      sizeof(boolean)),
@@ -150,12 +147,19 @@ static void * ec_alloc(size_t size)
   return p;
 }
 
-/* Address of the pointer member one row of a block table describes. Every
-   data pointer of ecx_parcelt has the same representation on every target this
-   shim is built for, which is what makes the offset lookup safe. */
-static void ** ec_block_slot(void * object, const ec_blockt * block)
+/* Read/write pointer slots via memcpy to avoid strict-aliasing UB across
+   typed pointer fields inside ecx_parcelt. */
+static void * ec_block_load(const void * object, const ec_blockt * block)
 {
-  return (void **)((char *)object + block->offset);
+  void * ptr;
+
+  memcpy(&ptr, (const char *)object + block->offset, sizeof(ptr));
+  return ptr;
+}
+
+static void ec_block_store(void * object, const ec_blockt * block, void * ptr)
+{
+  memcpy((char *)object + block->offset, &ptr, sizeof(ptr));
 }
 
 /* Allocate every block of a table. Returns 0 when all rows were filled, or 1
@@ -167,10 +171,10 @@ static size_t ec_alloc_blocks(void * object, const ec_blockt * table, size_t row
 
   for(row = 0; row < rows; row++)
   {
-    void ** slot = ec_block_slot(object, &table[row]);
+    void * ptr = ec_alloc(table[row].size);
 
-    *slot = ec_alloc(table[row].size);
-    if(*slot == NULL)
+    ec_block_store(object, &table[row], ptr);
+    if(ptr == NULL)
     {
       return 1;
     }
@@ -186,12 +190,64 @@ static void ec_free_blocks(void * object, const ec_blockt * table, size_t rows)
 
   for(row = 0; row < rows; row++)
   {
-    void ** slot = ec_block_slot(object, &table[row]);
+    void * ptr = ec_block_load(object, &table[row]);
 
-    osal_free(*slot);
-    *slot = NULL;
+    osal_free(ptr);
+    ec_block_store(object, &table[row], NULL);
   }
 }
+
+/* -------------------------------------------------------------------static
+   Thread handle helpers                                                   */
+
+#if defined(_WIN32)
+
+static int ec_thread_is_active(const ecx_parcelt * parcel)
+{
+  return *parcel->thread != NULL;
+}
+
+static void ec_thread_clear(ecx_parcelt * parcel)
+{
+  *parcel->thread = NULL;
+}
+
+#elif defined(__linux__)
+
+/* In SOEM's linux OSAL, OSAL_THREAD_HANDLE is "pthread_t *", so parcel->thread
+   is accessed through memcpy to match pthread_create()/pthread_join() without
+   strict-aliasing violations. */
+static pthread_t ec_thread_load(const ecx_parcelt * parcel)
+{
+  pthread_t  thread;
+
+  memcpy(&thread, parcel->thread, sizeof(thread));
+  return thread;
+}
+
+static int ec_thread_is_active(const ecx_parcelt * parcel)
+{
+  return ec_thread_load(parcel) != (pthread_t)0;
+}
+
+static void ec_thread_clear(ecx_parcelt * parcel)
+{
+  memset(parcel->thread, 0, sizeof(pthread_t));
+}
+
+#else
+
+static int ec_thread_is_active(const ecx_parcelt * parcel)
+{
+  return *parcel->thread != 0;
+}
+
+static void ec_thread_clear(ecx_parcelt * parcel)
+{
+  *parcel->thread = 0;
+}
+
+#endif
 
 /* ------------------------------------------------------------------exported
    Context lifecycle                                                       */
@@ -214,6 +270,12 @@ ecx_contextt * ec_malloc_context(void)
     ec_free_context(context);
     return NULL;
   }
+#if defined(__linux__)
+  /* On Linux, socket handles default to 0 after memset, which would close
+     stdin in ecx_closenic() if ecx_init() failed or wasn't redundant. */
+  context->port.sockhandle = -1;
+  context->port.redport->sockhandle = -1;
+#endif
   return context;
 }
 
@@ -274,6 +336,26 @@ void ec_free_parcel(ecx_parcelt * parcel)
 {
   if(parcel != NULL)
   {
+    if(parcel->thread != NULL)
+    {
+#if defined(_WIN32)
+      HANDLE  handle = *parcel->thread;
+
+      if(handle != NULL)
+      {
+        (void)CloseHandle(handle);
+        ec_thread_clear(parcel);
+      }
+#elif defined(__linux__)
+      pthread_t  thread = ec_thread_load(parcel);
+
+      if(thread != (pthread_t)0)
+      {
+        (void)pthread_detach(thread);
+        ec_thread_clear(parcel);
+      }
+#endif
+    }
     ec_free_blocks(parcel, ec_parcel_blocks, EC_BLOCKS(ec_parcel_blocks));
     parcel->context = NULL;
     osal_free(parcel);
@@ -281,16 +363,25 @@ void ec_free_parcel(ecx_parcelt * parcel)
 }
 
 /* -------------------------------------------------------------------static
-   Cycle timer. The cyclic thread has to wake up once per cycle. Linux gets an
-   absolute CLOCK_MONOTONIC deadline so that one slow cycle does not shift the
-   whole series, the other OSAL targets only have a relative sleep.           */
+   Cycle timer. Both Linux and Windows keep an absolute monotonic deadline so
+   that sub-cycle jitter does not accumulate into cycle drift, while overruns
+   greater than a cycle resync cleanly instead of bursting back-to-back.     */
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
 
 typedef struct
 {
-  struct timespec  deadline;   /* next wake-up, absolute CLOCK_MONOTONIC */
+  struct timespec  deadline;   /* next wake-up, absolute monotonic clock */
 } ec_timert;
+
+static void ec_monotonic_now(struct timespec * ts)
+{
+#if defined(__linux__)
+  clock_gettime(CLOCK_MONOTONIC, ts);
+#else
+  osal_get_monotonic_time(ts);
+#endif
+}
 
 /* Add nanoseconds to an absolute timespec. */
 static void ec_timespec_add(struct timespec * ts, int64 nsec)
@@ -304,46 +395,101 @@ static void ec_timespec_add(struct timespec * ts, int64 nsec)
   ts->tv_nsec += (long)rest;
   if(ts->tv_nsec < 0)
   {
-    /* the correction ec_sync() produces is signed, so tv_nsec can go below
-       zero */
+    /* a signed offset can cross the zero nanosecond boundary */
     ts->tv_nsec += (long)EC_NSEC_PER_SEC;
     ts->tv_sec  -= 1;
   }
   else if(ts->tv_nsec >= (long)EC_NSEC_PER_SEC)
   {
-    /* clock_nanosleep() rejects a tv_nsec of one second or more with EINVAL,
-       so normalise with '>=' like the SOEM reference does
-       (SOEM/test/linux/red_test/red_test.c:161-175). */
+    /* clock_nanosleep() rejects tv_nsec >= 1s with EINVAL */
     ts->tv_nsec -= (long)EC_NSEC_PER_SEC;
     ts->tv_sec  += 1;
   }
 }
 
-/* Round the first deadline up to the next whole millisecond, as the SOEM
-   reference does (SOEM/test/linux/red_test/red_test.c:199), so the series of
-   cycles starts on a clean millisecond boundary. */
+static int ec_timespec_le(const struct timespec * a, const struct timespec * b)
+{
+  if(a->tv_sec != b->tv_sec)
+  {
+    return a->tv_sec < b->tv_sec;
+  }
+  return a->tv_nsec <= b->tv_nsec;
+}
+
+/* Round the first deadline up to the next whole millisecond so cycles begin
+   on a clean millisecond boundary. */
 static void ec_timer_start(ec_timert * timer)
 {
-  clock_gettime(CLOCK_MONOTONIC, &timer->deadline);
-  timer->deadline.tv_nsec = ((timer->deadline.tv_nsec / (long)EC_NSEC_PER_MSEC)
-                             + 1) * (long)EC_NSEC_PER_MSEC;
-  if(timer->deadline.tv_nsec >= (long)EC_NSEC_PER_SEC)
+  long  next_msec;
+
+  ec_monotonic_now(&timer->deadline);
+  next_msec = (timer->deadline.tv_nsec / (long)EC_NSEC_PER_MSEC) + 1L;
+  if(next_msec >= 1000L)
   {
-    timer->deadline.tv_nsec -= (long)EC_NSEC_PER_SEC;
-    timer->deadline.tv_sec  += 1;
+    timer->deadline.tv_nsec = 0L;
+    timer->deadline.tv_sec += 1;
+  }
+  else
+  {
+    timer->deadline.tv_nsec = next_msec * (long)EC_NSEC_PER_MSEC;
   }
 }
 
-static void ec_timer_sleep(ec_timert * timer, int64 nsec)
+static void ec_timer_sleep(ec_timert * timer, int64 nsec,
+                           const volatile boolean * dorun)
 {
-  ec_timespec_add(&timer->deadline, nsec);
-  while(clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &timer->deadline,
-                        NULL) == EINTR)
+  struct timespec  now;
+
+  ec_monotonic_now(&now);
+  if(nsec <= 0)
   {
+    /* Do not walk the absolute deadline backwards; resync to monotonic now. */
+    timer->deadline = now;
+    return;
+  }
+  if(nsec > EC_MAX_SLEEP_NSEC)
+  {
+    nsec = EC_MAX_SLEEP_NSEC;
+  }
+  ec_timespec_add(&timer->deadline, nsec);
+  if(ec_timespec_le(&timer->deadline, &now))
+  {
+    /* This cycle overran past the next deadline: resync instead of firing
+       un-throttled catch-up bursts. */
+    timer->deadline = now;
+    return;
+  }
+  while(!ec_timespec_le(&timer->deadline, &now))
+  {
+    struct timespec        slice;
+    const struct timespec *target;
+
+    if(dorun != NULL && !*dorun)
+    {
+      return;
+    }
+    slice = now;
+    ec_timespec_add(&slice, EC_SLEEP_SLICE_NSEC);
+    target = ec_timespec_le(&timer->deadline, &slice) ? &timer->deadline : &slice;
+#if defined(__linux__)
+    while(clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, target, NULL) == EINTR)
+    {
+    }
+#else
+    {
+      struct timespec  deadline_copy = *target;
+      (void)osal_monotonic_sleep(&deadline_copy);
+    }
+#endif
+    if(target == &timer->deadline)
+    {
+      return;
+    }
+    ec_monotonic_now(&now);
   }
 }
 
-#else  /* no absolute monotonic sleep available through libc here */
+#else  /* no absolute monotonic sleep available here */
 
 typedef struct
 {
@@ -355,37 +501,74 @@ static void ec_timer_start(ec_timert * timer)
   (void)timer;
 }
 
-static void ec_timer_sleep(ec_timert * timer, int64 nsec)
+static void ec_timer_sleep(ec_timert * timer, int64 nsec,
+                           const volatile boolean * dorun)
 {
-  int64  usec;
+  int64  remaining_usec;
 
   (void)timer;
-  if(nsec > 0)
+  if(nsec <= 0)
   {
-    usec = nsec / EC_NSEC_PER_USEC;
-    if(usec > (int64)0xFFFFFFFFU)
-    {
-      usec = (int64)0xFFFFFFFFU;
-    }
-    osal_usleep((uint32)usec);
+    return;
   }
-  /* nsec <= 0 means "this cycle is already late": run the next cycle at once
-     instead of sleeping, and never hand a negative length to osal_usleep()
-     (fact F5). */
+  if(nsec > EC_MAX_SLEEP_NSEC)
+  {
+    nsec = EC_MAX_SLEEP_NSEC;
+  }
+  remaining_usec = nsec / EC_NSEC_PER_USEC;
+  while(remaining_usec > 0)
+  {
+    int64  step_usec;
+
+    if(dorun != NULL && !*dorun)
+    {
+      return;
+    }
+    step_usec = (remaining_usec > EC_SLEEP_SLICE_USEC)
+                ? EC_SLEEP_SLICE_USEC
+                : remaining_usec;
+    osal_usleep((uint32)step_usec);
+    remaining_usec -= step_usec;
+  }
 }
 
 #endif
 
-/* -------------------------------------------------------------------static
-   DC drift correction. Same loop filter as the SOEM reference examples:
-   reftime is the DC time reported by the slaves, *offsettime is what the next
-   cycle has to be shorter or longer by, and integral is the integrator state
-   the caller keeps between cycles.                                          */
+/* Combine cycle and toff without signed overflow, clamped to
+   [0, EC_MAX_SLEEP_NSEC]. */
+static int64 ec_cycle_step(int64 cycle, int64 toff)
+{
+  if(cycle <= 0)
+  {
+    return 0;
+  }
+  if(cycle > EC_MAX_SLEEP_NSEC)
+  {
+    cycle = EC_MAX_SLEEP_NSEC;
+  }
+  if(toff < -cycle)
+  {
+    return 0;
+  }
+  if(toff > (EC_MAX_SLEEP_NSEC - cycle))
+  {
+    return EC_MAX_SLEEP_NSEC;
+  }
+  return cycle + toff;
+}
 
-static void ec_sync(int64 * reftime, int64 cycletime, int64 * offsettime,
+/* -------------------------------------------------------------------static
+   DC drift correction. PI controller that locks the host cycle timer to the
+   slave reference clock DCtime without signed overflow or integrator windup. */
+
+static void ec_sync(int64 reftime, int64 cycletime, int64 * offsettime,
                     int64 * integral)
 {
+  int64  r;
   int64  delta;
+  int64  half_cycle;
+  int64  max_integral;
+  int64  correction;
 
   if(cycletime <= 0)
   {
@@ -394,24 +577,59 @@ static void ec_sync(int64 * reftime, int64 cycletime, int64 * offsettime,
     *offsettime = 0;
     return;
   }
-  delta = (*reftime - EC_SYNC_REF_NSEC) % cycletime;
+
+  r = reftime % cycletime;
+  if(r < 0)
+  {
+    r += cycletime;
+  }
+  delta = r - (EC_SYNC_REF_NSEC % cycletime);
   if(delta < 0)
   {
     delta += cycletime;
   }
-  if(delta > (cycletime / 2))
+  half_cycle = cycletime / 2;
+  if(delta > half_cycle)
   {
     delta -= cycletime;
   }
+
+  max_integral = ((cycletime / 4) > (INT64_MAX / EC_SYNC_INTEGRATOR_DIV))
+                 ? INT64_MAX
+                 : (cycletime / 4) * EC_SYNC_INTEGRATOR_DIV;
   if(delta > 0)
   {
-    (*integral)++;
+    if(*integral < max_integral)
+    {
+      (*integral)++;
+    }
   }
   else if(delta < 0)
   {
-    (*integral)--;
+    if(*integral > -max_integral)
+    {
+      (*integral)--;
+    }
   }
-  *offsettime = -(delta / EC_SYNC_ERROR_SCALE) - (*integral / EC_SYNC_INTEGRATOR_DIV);
+  if(*integral > max_integral)
+  {
+    *integral = max_integral;
+  }
+  else if(*integral < -max_integral)
+  {
+    *integral = -max_integral;
+  }
+
+  correction = -(delta / EC_SYNC_ERROR_SCALE) - (*integral / EC_SYNC_INTEGRATOR_DIV);
+  if(correction > half_cycle)
+  {
+    correction = half_cycle;
+  }
+  else if(correction < -half_cycle)
+  {
+    correction = -half_cycle;
+  }
+  *offsettime = correction;
 }
 
 /* ------------------------------------------------------------------exported
@@ -419,7 +637,13 @@ static void ec_sync(int64 * reftime, int64 cycletime, int64 * offsettime,
    *parcel->dorun; the parcel is released only after this returned (see
    ec_free_parcel).                                                          */
 
+#if defined(_WIN32)
+static DWORD WINAPI ecatthread(LPVOID ptr)
+#elif defined(__linux__)
+static void * ecatthread(void * ptr)
+#else
 static OSAL_THREAD_FUNC_RT ecatthread(void * ptr)
+#endif
 {
   ecx_parcelt *      parcel = (ecx_parcelt *)ptr;
   ecx_contextt *     context;
@@ -429,6 +653,7 @@ static OSAL_THREAD_FUNC_RT ecatthread(void * ptr)
   volatile boolean * isprocess;
   int64 *            dctime;
   uint8 *            hasdc;
+  int                last_wkc;
   int64              cycle;
   int64              toff     = 0;
   int64              integral = 0;
@@ -440,7 +665,7 @@ static OSAL_THREAD_FUNC_RT ecatthread(void * ptr)
      || parcel->cycletime == NULL || parcel->dorun == NULL
      || parcel->isprocess == NULL)
   {
-    return;
+    goto done;
   }
   context   = parcel->context;
   wkc       = parcel->wkc;
@@ -452,27 +677,59 @@ static OSAL_THREAD_FUNC_RT ecatthread(void * ptr)
 
   ec_timer_start(&timer);
 
-  ecx_send_processdata(context);
-  while(*dorun)
+  if(*dorun)
   {
-    *wkc = ecx_receive_processdata(context, EC_TIMEOUTRET);
-    *isprocess = FALSE;
-
-    cycle = *cycletime;
-    ec_timer_sleep(&timer, cycle + toff);
-    if(!*dorun)
-    {
-      break;
-    }
-
     *isprocess = TRUE;
-    if(*hasdc)
-    {
-      ec_sync(dctime, cycle, &toff, &integral);
-    }
     ecx_send_processdata(context);
+    for(;;)
+    {
+      last_wkc = ecx_receive_processdata(context, EC_TIMEOUTRET);
+      *wkc = last_wkc;
+      *isprocess = FALSE;
+      if(!*dorun)
+      {
+        break;
+      }
+
+      if(last_wkc > 0 && context->grouplist[0].mbxstatus != NULL
+         && context->grouplist[0].mbxtxqueue.mbxmutex != NULL)
+      {
+        (void)ecx_mbxhandler(context, 0, ECAT_MBX_HANDLER_LIMIT);
+      }
+
+      cycle = *cycletime;
+      ec_timer_sleep(&timer, ec_cycle_step(cycle, toff), dorun);
+      if(!*dorun)
+      {
+        break;
+      }
+
+      *isprocess = TRUE;
+      if(*hasdc)
+      {
+        if(last_wkc > 0)
+        {
+          ec_sync(*dctime, cycle, &toff, &integral);
+        }
+      }
+      else
+      {
+        toff = 0;
+        integral = 0;
+      }
+      ecx_send_processdata(context);
+    }
   }
   *isprocess = FALSE;
+
+done:
+#if defined(_WIN32)
+  return 0;
+#elif defined(__linux__)
+  return NULL;
+#else
+  return;
+#endif
 }
 
 /* Start the cyclic thread. Returns 0 when the thread did not start. */
@@ -481,17 +738,17 @@ int ec_run(ecx_parcelt * parcel)
   if(parcel == NULL || parcel->context == NULL || parcel->thread == NULL
      || parcel->wkc == NULL || parcel->cycletime == NULL
      || parcel->dorun == NULL || parcel->isprocess == NULL
-     || *parcel->thread != 0)
+     || ec_thread_is_active(parcel))
   {
     return 0;
   }
   /* Clear the handle first, then trust the handle and not the return value
-     (fact F4). The cast is needed because osal_thread_create_rt() takes the
-     entry point as a void *, which is not a function pointer (C4152). */
-  *parcel->thread = 0;
+     (fact F4). The cast avoids C4152 function-pointer conversion warnings
+     when passing the entry point through osal_thread_create_rt(). */
+  ec_thread_clear(parcel);
   (void)osal_thread_create_rt(parcel->thread, ECAT_THREAD_STACKSIZE,
-                              (void *)&ecatthread, parcel);
-  return (*parcel->thread != 0);
+                              (void *)(uintptr_t)&ecatthread, parcel);
+  return ec_thread_is_active(parcel);
 }
 
 /* Wait until the cyclic thread left ecatthread(), for at most timeoutMillis
@@ -528,56 +785,61 @@ int ec_wait_thread(ecx_parcelt * parcel, int timeoutMillis)
      closes it, so closing it here is also what keeps one kernel object from
      leaking every time the ecat is started. */
   (void)CloseHandle(handle);
-  *parcel->thread = 0;
+  ec_thread_clear(parcel);
   return 1;
-#elif defined(__linux__) && defined(__GLIBC__)
-  /* On the ELF targets OSAL_THREAD_HANDLE is "pthread_t *", so the handle of
-     the parcel is the storage pthread_create() wrote the thread id in. */
-  pthread_t      *threadp;
-  struct timespec deadline;
-  long long       millis;
+#elif defined(__linux__)
+  pthread_t  thread;
 
   if(parcel == NULL || parcel->thread == NULL)
   {
     return -1;
   }
-  threadp = (pthread_t *)(void *)parcel->thread;
-  if(*threadp == 0)
+  thread = ec_thread_load(parcel);
+  if(thread == (pthread_t)0)
   {
     return 1;
   }
   if(timeoutMillis < 0)
   {
-    if(pthread_join(*threadp, NULL) != 0)
+    if(pthread_join(thread, NULL) != 0)
     {
       return 0;
     }
-    *threadp = 0;
+    ec_thread_clear(parcel);
     return 1;
   }
-  if(clock_gettime(CLOCK_REALTIME, &deadline) != 0)
+#if defined(__GLIBC__)
+  if(timeoutMillis == 0)
   {
-    return -1;
+    if(pthread_tryjoin_np(thread, NULL) != 0)
+    {
+      return 0;
+    }
+    ec_thread_clear(parcel);
+    return 1;
   }
-  millis = (long long)timeoutMillis;
-  deadline.tv_sec  += (time_t)(millis / 1000);
-  deadline.tv_nsec += (long)((millis % 1000) * 1000000L);
-  if(deadline.tv_nsec >= 1000000000L)
   {
-    deadline.tv_sec  += 1;
-    deadline.tv_nsec -= 1000000000L;
+    struct timespec  deadline;
+
+    if(clock_gettime(CLOCK_REALTIME, &deadline) != 0)
+    {
+      return -1;
+    }
+    ec_timespec_add(&deadline, (int64)timeoutMillis * EC_NSEC_PER_MSEC);
+    if(pthread_timedjoin_np(thread, NULL, &deadline) != 0)
+    {
+      /* ETIMEDOUT: the thread is still inside ecatthread(). */
+      return 0;
+    }
+    ec_thread_clear(parcel);
+    return 1;
   }
-  if(pthread_timedjoin_np(*threadp, NULL, &deadline) != 0)
-  {
-    /* ETIMEDOUT: the thread is still inside ecatthread(). */
-    return 0;
-  }
-  *threadp = 0;
-  return 1;
 #else
-  /* macOS (pthread_t without a timed join), intime, rtk and vxworks give no
-     portable way to wait a thread handle: the caller has to fall back to
-     waiting longer than one cycle. */
+  return -1;
+#endif
+#else
+  /* macOS / rtk / other targets give no portable timed-join here: the caller
+     falls back to waiting longer than one cycle. */
   (void)parcel;
   (void)timeoutMillis;
   return -1;
@@ -588,23 +850,20 @@ int ec_wait_thread(ecx_parcelt * parcel, int timeoutMillis)
 
    ec_adapters() answers the linked list of the adapters of the machine, in the
    order the platform reports them, and ec_free_adapters_list() releases it.
-   The pair is exported instead of SOEM's ec_find_adapters() /
-   ec_free_adapters() pair, which is broken on Windows by fact F7; the ELF
-   targets have no such flaw, so they keep the SOEM answer there. A list
-   answered by ec_adapters() is released by ec_free_adapters_list() only: the
-   nodes of the Windows list are allocated here, and SOEM would release them
-   with its own allocator. */
+   Windows and Linux enumerate interfaces into zeroed ec_alloc() nodes with
+   explicit OOM/NULL handling and release them via osal_free(). Other targets
+   delegate to SOEM's ec_find_adapters() / ec_free_adapters(). */
 ec_adaptert * ec_adapters(void)
 {
 #if defined(_WIN32)
-  pcap_if_t   * alldevs;
+  pcap_if_t   * alldevs = NULL;
   pcap_if_t   * device;
   ec_adaptert * adapter;
   ec_adaptert * prev_adapter = NULL;
   ec_adaptert * ret_adapter  = NULL;
   char          errbuf[PCAP_ERRBUF_SIZE];
 
-  if (pcap_findalldevs(&alldevs, errbuf) == -1)
+  if (pcap_findalldevs(&alldevs, errbuf) != 0)
   {
     return NULL;
   }
@@ -630,14 +889,59 @@ ec_adaptert * ec_adapters(void)
     if (device->name != NULL)
     {
       strncpy(adapter->name, device->name, EC_MAXLEN_ADAPTERNAME - 1);
+      adapter->name[EC_MAXLEN_ADAPTERNAME - 1] = '\0';
     }
     if (device->description != NULL)
     {
       strncpy(adapter->desc, device->description, EC_MAXLEN_ADAPTERNAME - 1);
+      adapter->desc[EC_MAXLEN_ADAPTERNAME - 1] = '\0';
     }
     prev_adapter = adapter;
   }
-  pcap_freealldevs(alldevs);
+  if (alldevs != NULL)
+  {
+    pcap_freealldevs(alldevs);
+  }
+  return ret_adapter;
+#elif defined(__linux__)
+  struct if_nameindex * ids;
+  size_t                i;
+  ec_adaptert         * adapter;
+  ec_adaptert         * prev_adapter = NULL;
+  ec_adaptert         * ret_adapter  = NULL;
+
+  ids = if_nameindex();
+  if (ids == NULL)
+  {
+    return NULL;
+  }
+  for (i = 0; ids[i].if_index != 0; i++)
+  {
+    adapter = (ec_adaptert *)ec_alloc(sizeof(ec_adaptert));
+    if (adapter == NULL)
+    {
+      ec_free_adapters_list(ret_adapter);
+      ret_adapter = NULL;
+      break;
+    }
+    if (prev_adapter != NULL)
+    {
+      prev_adapter->next = adapter;
+    }
+    else
+    {
+      ret_adapter = adapter;
+    }
+    if (ids[i].if_name != NULL)
+    {
+      strncpy(adapter->name, ids[i].if_name, EC_MAXLEN_ADAPTERNAME - 1);
+      adapter->name[EC_MAXLEN_ADAPTERNAME - 1] = '\0';
+      strncpy(adapter->desc, ids[i].if_name, EC_MAXLEN_ADAPTERNAME - 1);
+      adapter->desc[EC_MAXLEN_ADAPTERNAME - 1] = '\0';
+    }
+    prev_adapter = adapter;
+  }
+  if_freenameindex(ids);
   return ret_adapter;
 #else
   return ec_find_adapters();
@@ -646,7 +950,7 @@ ec_adaptert * ec_adapters(void)
 
 void ec_free_adapters_list(ec_adaptert * list)
 {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
   while (list != NULL)
   {
     ec_adaptert * next = list->next;
@@ -656,4 +960,52 @@ void ec_free_adapters_list(ec_adaptert * list)
 #else
   ec_free_adapters(list);
 #endif
+}
+
+int ec_stop(ecx_parcelt * parcel, int timeoutMillis)
+{
+  if(parcel == NULL)
+  {
+    return -1;
+  }
+  if(parcel->dorun != NULL)
+  {
+    *((volatile boolean *)parcel->dorun) = FALSE;
+  }
+  return ec_wait_thread(parcel, timeoutMillis);
+}
+
+const char * ec_version(void)
+{
+  return DECOTOFUSOEM_VERSION_STRING;
+}
+
+size_t ec_sizeof_context(void)
+{
+  return sizeof(ecx_contextt);
+}
+
+size_t ec_sizeof_parcel(void)
+{
+  return sizeof(ecx_parcelt);
+}
+
+size_t ec_sizeof_slave(void)
+{
+  return sizeof(ec_slavet);
+}
+
+size_t ec_sizeof_group(void)
+{
+  return sizeof(ec_groupt);
+}
+
+int ec_max_slave(void)
+{
+  return EC_MAXSLAVE;
+}
+
+int ec_max_group(void)
+{
+  return EC_MAXGROUP;
 }
